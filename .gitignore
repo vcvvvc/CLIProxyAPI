@@ -6,6 +6,12 @@ cli-proxy-api
 config.yaml
 .env
 
+# Local runtime certificates and logs
+privkey.pem
+fullchain.pem
+pem/
+output.log
+
 # Generated content
 bin/*
 logs/*

@@ -85,6 +85,7 @@ const (
 	quotaBackoffMax           = 30 * time.Minute
 	usageLimitFreezeDuration  = 721 * time.Hour
 	successFreezeThreshold    = int64(50)
+	successFreezeReason       = "limit_50"
 )
 
 var quotaCooldownDisabled atomic.Bool
@@ -1190,12 +1191,13 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 		}
 		auth.Success = existing.Success
 		auth.Failed = existing.Failed
+		auth.successFreezeCount = existing.successFreezeCount
 		auth.recentRequests = existing.recentRequests
 		if !existing.Disabled && existing.Status != StatusDisabled && !auth.Disabled && auth.Status != StatusDisabled {
 			if len(auth.ModelStates) == 0 && len(existing.ModelStates) > 0 {
 				auth.ModelStates = existing.ModelStates
 			}
-			if existing.Quota.Exceeded && existing.Quota.Reason == "usage_limit_reached" && existing.Quota.NextRecoverAt.After(time.Now()) {
+			if existing.Quota.Exceeded && isRuntimeFreezeReason(existing.Quota.Reason) && existing.Quota.NextRecoverAt.After(time.Now()) {
 				auth.Unavailable = true
 				auth.NextRetryAfter = existing.Quota.NextRecoverAt
 				auth.Quota = existing.Quota
@@ -1260,7 +1262,8 @@ func (m *Manager) Load(ctx context.Context) error {
 
 func applyRuntimeFreezes(auths map[string]*Auth, freezes []RuntimeFreezeState, now time.Time) {
 	for _, freeze := range freezes {
-		if strings.TrimSpace(freeze.Reason) != "usage_limit_reached" || !freeze.NextRecoverAt.After(now) {
+		reason := strings.TrimSpace(freeze.Reason)
+		if !isRuntimeFreezeReason(reason) || !freeze.NextRecoverAt.After(now) {
 			continue
 		}
 		auth := auths[strings.TrimSpace(freeze.AuthID)]
@@ -1269,8 +1272,17 @@ func applyRuntimeFreezes(auths map[string]*Auth, freezes []RuntimeFreezeState, n
 		}
 		auth.Unavailable = true
 		auth.NextRetryAfter = freeze.NextRecoverAt
-		auth.Quota = QuotaState{Exceeded: true, Reason: "usage_limit_reached", NextRecoverAt: freeze.NextRecoverAt}
+		auth.Quota = QuotaState{Exceeded: true, Reason: reason, NextRecoverAt: freeze.NextRecoverAt}
 		auth.UpdatedAt = now
+	}
+}
+
+func isRuntimeFreezeReason(reason string) bool {
+	switch strings.TrimSpace(reason) {
+	case "usage_limit_reached", successFreezeReason:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -1289,7 +1301,7 @@ func (m *Manager) refreshRuntimeFreezeForAuth(ctx context.Context, auth *Auth) (
 	now := time.Now()
 	probe := auth.Clone()
 	applyRuntimeFreezes(map[string]*Auth{probe.ID: probe}, freezes, now)
-	if !(probe.Quota.Exceeded && probe.Quota.Reason == "usage_limit_reached" && probe.Quota.NextRecoverAt.After(now)) {
+	if !(probe.Quota.Exceeded && isRuntimeFreezeReason(probe.Quota.Reason) && probe.Quota.NextRecoverAt.After(now)) {
 		return false, nil
 	}
 	snapshot := probe
@@ -2403,13 +2415,15 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		auth.recordRecentRequest(now, result.Success)
 		if result.Success {
 			auth.Success++
-			if auth.Success == successFreezeThreshold && !(auth.Quota.Exceeded && auth.Quota.Reason == "usage_limit_reached" && auth.Quota.NextRecoverAt.After(now)) {
+			auth.successFreezeCount++
+			if auth.successFreezeCount == successFreezeThreshold && !(auth.Quota.Exceeded && isRuntimeFreezeReason(auth.Quota.Reason) && auth.Quota.NextRecoverAt.After(now)) {
 				next := now.Add(usageLimitFreezeDuration)
 				auth.Unavailable = true
 				auth.NextRetryAfter = next
-				auth.Quota = QuotaState{Exceeded: true, Reason: "usage_limit_reached", NextRecoverAt: next}
+				auth.Quota = QuotaState{Exceeded: true, Reason: successFreezeReason, NextRecoverAt: next}
+				auth.successFreezeCount = 0
 				auth.UpdatedAt = now
-				runtimeFreeze = &RuntimeFreezeState{AuthID: auth.ID, Reason: "usage_limit_reached", NextRecoverAt: next}
+				runtimeFreeze = &RuntimeFreezeState{AuthID: auth.ID, Reason: successFreezeReason, NextRecoverAt: next}
 				if store, ok := m.store.(RuntimeFreezeStore); ok {
 					runtimeFreezeStore = store
 				}
@@ -2419,7 +2433,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		}
 
 		if result.Success {
-			if auth.Quota.Exceeded && auth.Quota.Reason == "usage_limit_reached" && auth.Quota.NextRecoverAt.After(now) {
+			if auth.Quota.Exceeded && isRuntimeFreezeReason(auth.Quota.Reason) && auth.Quota.NextRecoverAt.After(now) {
 				auth.Unavailable = true
 				auth.NextRetryAfter = auth.Quota.NextRecoverAt
 				auth.UpdatedAt = now
@@ -2510,6 +2524,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 								next = now.Add(usageLimitFreezeDuration)
 								backoffLevel = 0
 								reason = "usage_limit_reached"
+								auth.successFreezeCount = 0
 								runtimeFreeze = &RuntimeFreezeState{AuthID: auth.ID, Reason: reason, NextRecoverAt: next}
 								if store, ok := m.store.(RuntimeFreezeStore); ok {
 									runtimeFreezeStore = store
