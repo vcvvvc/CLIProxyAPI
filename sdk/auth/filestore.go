@@ -25,6 +25,8 @@ type FileTokenStore struct {
 	baseDir string
 }
 
+const runtimeFreezePath = "/root/.cli-proxy-api/group2/freeze.json"
+
 // NewFileTokenStore creates a token store that saves credentials to disk through the
 // TokenStorage implementation embedded in the token record.
 func NewFileTokenStore() *FileTokenStore {
@@ -170,6 +172,124 @@ func (s *FileTokenStore) Delete(ctx context.Context, id string) error {
 	}
 	if err = os.Remove(path); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("auth filestore: delete failed: %w", err)
+	}
+	return nil
+}
+
+func (s *FileTokenStore) ListRuntimeFreezes(ctx context.Context) ([]cliproxyauth.RuntimeFreezeState, error) {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+	}
+	path, err := s.runtimeFreezePath()
+	if err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("auth filestore: read runtime freezes failed: %w", err)
+	}
+	if len(data) == 0 {
+		return nil, nil
+	}
+	var states []cliproxyauth.RuntimeFreezeState
+	if err := json.Unmarshal(data, &states); err != nil {
+		return nil, fmt.Errorf("auth filestore: unmarshal runtime freezes failed: %w", err)
+	}
+	return states, nil
+}
+
+func (s *FileTokenStore) SaveRuntimeFreeze(ctx context.Context, state cliproxyauth.RuntimeFreezeState) error {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
+	state.AuthID = strings.TrimSpace(state.AuthID)
+	state.Reason = strings.TrimSpace(state.Reason)
+	if state.AuthID == "" || state.Reason == "" || state.NextRecoverAt.IsZero() {
+		return fmt.Errorf("auth filestore: invalid runtime freeze state")
+	}
+	path, err := s.runtimeFreezePath()
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	data, err := os.ReadFile(path)
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("auth filestore: read runtime freezes failed: %w", err)
+	}
+	var states []cliproxyauth.RuntimeFreezeState
+	if len(data) > 0 {
+		if err := json.Unmarshal(data, &states); err != nil {
+			return fmt.Errorf("auth filestore: unmarshal runtime freezes failed: %w", err)
+		}
+	}
+	replaced := false
+	for i := range states {
+		if strings.TrimSpace(states[i].AuthID) == state.AuthID {
+			states[i] = state
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		states = append(states, state)
+	}
+	raw, err := json.MarshalIndent(states, "", "  ")
+	if err != nil {
+		return fmt.Errorf("auth filestore: marshal runtime freezes failed: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return fmt.Errorf("auth filestore: create runtime freeze dir failed: %w", err)
+	}
+	if err := os.WriteFile(path, append(raw, '\n'), 0o600); err != nil {
+		return fmt.Errorf("auth filestore: write runtime freezes failed: %w", err)
+	}
+	return nil
+}
+
+func (s *FileTokenStore) DeleteRuntimeFreeze(ctx context.Context, authID string) error {
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		return fmt.Errorf("auth filestore: runtime freeze auth id is empty")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	states, err := s.ListRuntimeFreezes(ctx)
+	if err != nil {
+		return err
+	}
+	kept := states[:0]
+	for _, state := range states {
+		if strings.TrimSpace(state.AuthID) != authID {
+			kept = append(kept, state)
+		}
+	}
+	if len(kept) == len(states) {
+		return nil
+	}
+	path, err := s.runtimeFreezePath()
+	if err != nil {
+		return err
+	}
+	if len(kept) == 0 {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("auth filestore: delete runtime freezes failed: %w", err)
+		}
+		return nil
+	}
+	raw, err := json.MarshalIndent(kept, "", "  ")
+	if err != nil {
+		return fmt.Errorf("auth filestore: marshal runtime freezes failed: %w", err)
+	}
+	if err := os.WriteFile(path, append(raw, '\n'), 0o600); err != nil {
+		return fmt.Errorf("auth filestore: write runtime freezes failed: %w", err)
 	}
 	return nil
 }
@@ -327,6 +447,10 @@ func (s *FileTokenStore) baseDirSnapshot() string {
 	s.dirLock.RLock()
 	defer s.dirLock.RUnlock()
 	return s.baseDir
+}
+
+func (s *FileTokenStore) runtimeFreezePath() (string, error) {
+	return runtimeFreezePath, nil
 }
 
 func extractAccessToken(metadata map[string]any) string {

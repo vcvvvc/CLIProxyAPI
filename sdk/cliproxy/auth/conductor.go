@@ -25,6 +25,7 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
 
@@ -82,6 +83,8 @@ const (
 	refreshIneffectiveBackoff = 30 * time.Second
 	quotaBackoffBase          = time.Second
 	quotaBackoffMax           = 30 * time.Minute
+	usageLimitFreezeDuration  = 721 * time.Hour
+	successFreezeThreshold    = int64(50)
 )
 
 var quotaCooldownDisabled atomic.Bool
@@ -887,6 +890,9 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
 			result.RetryAfter = retryAfterFromError(errStream)
 			m.MarkResult(ctx, result)
+			if isUsageLimitReachedResultError(result.Error) {
+				return nil, errStream
+			}
 			if isRequestInvalidError(errStream) {
 				return nil, errStream
 			}
@@ -919,6 +925,10 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
 				result.RetryAfter = retryAfterFromError(bootstrapErr)
 				m.MarkResult(ctx, result)
+				if isUsageLimitReachedResultError(result.Error) {
+					discardStreamChunks(streamResult.Chunks)
+					return nil, newStreamBootstrapError(bootstrapErr, streamResult.Headers)
+				}
 				discardStreamChunks(streamResult.Chunks)
 				lastErr = bootstrapErr
 				continue
@@ -1163,6 +1173,15 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	if auth == nil || auth.ID == "" {
 		return nil, nil
 	}
+	var freezes []RuntimeFreezeState
+	if store, ok := m.store.(RuntimeFreezeStore); ok {
+		listed, err := store.ListRuntimeFreezes(ctx)
+		if err != nil {
+			logEntryWithRequestID(ctx).WithField("auth_id", auth.ID).Warnf("failed to load runtime freezes during auth update: %v", err)
+		} else {
+			freezes = listed
+		}
+	}
 	m.mu.Lock()
 	if existing, ok := m.auths[auth.ID]; ok && existing != nil {
 		if !auth.indexAssigned && auth.Index == "" {
@@ -1176,7 +1195,15 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 			if len(auth.ModelStates) == 0 && len(existing.ModelStates) > 0 {
 				auth.ModelStates = existing.ModelStates
 			}
+			if existing.Quota.Exceeded && existing.Quota.Reason == "usage_limit_reached" && existing.Quota.NextRecoverAt.After(time.Now()) {
+				auth.Unavailable = true
+				auth.NextRetryAfter = existing.Quota.NextRecoverAt
+				auth.Quota = existing.Quota
+			}
 		}
+	}
+	if len(freezes) > 0 {
+		applyRuntimeFreezes(map[string]*Auth{auth.ID: auth}, freezes, time.Now())
 	}
 	auth.EnsureIndex()
 	authClone := auth.Clone()
@@ -1204,6 +1231,14 @@ func (m *Manager) Load(ctx context.Context) error {
 		m.mu.Unlock()
 		return err
 	}
+	var freezes []RuntimeFreezeState
+	if store, ok := m.store.(RuntimeFreezeStore); ok {
+		freezes, err = store.ListRuntimeFreezes(ctx)
+		if err != nil {
+			m.mu.Unlock()
+			return err
+		}
+	}
 	m.auths = make(map[string]*Auth, len(items))
 	for _, auth := range items {
 		if auth == nil || auth.ID == "" {
@@ -1212,6 +1247,7 @@ func (m *Manager) Load(ctx context.Context) error {
 		auth.EnsureIndex()
 		m.auths[auth.ID] = auth.Clone()
 	}
+	applyRuntimeFreezes(m.auths, freezes, time.Now())
 	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
 	if cfg == nil {
 		cfg = &internalconfig.Config{}
@@ -1220,6 +1256,53 @@ func (m *Manager) Load(ctx context.Context) error {
 	m.mu.Unlock()
 	m.syncScheduler()
 	return nil
+}
+
+func applyRuntimeFreezes(auths map[string]*Auth, freezes []RuntimeFreezeState, now time.Time) {
+	for _, freeze := range freezes {
+		if strings.TrimSpace(freeze.Reason) != "usage_limit_reached" || !freeze.NextRecoverAt.After(now) {
+			continue
+		}
+		auth := auths[strings.TrimSpace(freeze.AuthID)]
+		if auth == nil {
+			continue
+		}
+		auth.Unavailable = true
+		auth.NextRetryAfter = freeze.NextRecoverAt
+		auth.Quota = QuotaState{Exceeded: true, Reason: "usage_limit_reached", NextRecoverAt: freeze.NextRecoverAt}
+		auth.UpdatedAt = now
+	}
+}
+
+func (m *Manager) refreshRuntimeFreezeForAuth(ctx context.Context, auth *Auth) (bool, error) {
+	if auth == nil || auth.ID == "" {
+		return false, nil
+	}
+	store, ok := m.store.(RuntimeFreezeStore)
+	if !ok {
+		return false, nil
+	}
+	freezes, err := store.ListRuntimeFreezes(ctx)
+	if err != nil {
+		return false, err
+	}
+	now := time.Now()
+	probe := auth.Clone()
+	applyRuntimeFreezes(map[string]*Auth{probe.ID: probe}, freezes, now)
+	if !(probe.Quota.Exceeded && probe.Quota.Reason == "usage_limit_reached" && probe.Quota.NextRecoverAt.After(now)) {
+		return false, nil
+	}
+	snapshot := probe
+	m.mu.Lock()
+	if current := m.auths[auth.ID]; current != nil {
+		applyRuntimeFreezes(map[string]*Auth{auth.ID: current}, freezes, now)
+		snapshot = current.Clone()
+	}
+	m.mu.Unlock()
+	if m.scheduler != nil {
+		m.scheduler.upsertAuth(snapshot)
+	}
+	return true, nil
 }
 
 // Execute performs a non-streaming execution using the configured selector and executor.
@@ -1405,6 +1488,10 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 					result.RetryAfter = ra
 				}
 				m.MarkResult(execCtx, result)
+				if isUsageLimitReachedResultError(result.Error) {
+					authErr = errExec
+					break
+				}
 				if isRequestInvalidError(errExec) {
 					return cliproxyexecutor.Response{}, errExec
 				}
@@ -1504,6 +1591,10 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 					result.RetryAfter = ra
 				}
 				m.MarkResult(execCtx, result)
+				if isUsageLimitReachedResultError(result.Error) {
+					authErr = errExec
+					break
+				}
 				if isRequestInvalidError(errExec) {
 					return cliproxyexecutor.Response{}, errExec
 				}
@@ -2303,6 +2394,8 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	clearModelQuota := false
 	setModelQuota := false
 	var authSnapshot *Auth
+	var runtimeFreeze *RuntimeFreezeState
+	var runtimeFreezeStore RuntimeFreezeStore
 
 	m.mu.Lock()
 	if auth, ok := m.auths[result.AuthID]; ok && auth != nil {
@@ -2310,12 +2403,27 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		auth.recordRecentRequest(now, result.Success)
 		if result.Success {
 			auth.Success++
+			if auth.Success == successFreezeThreshold && !(auth.Quota.Exceeded && auth.Quota.Reason == "usage_limit_reached" && auth.Quota.NextRecoverAt.After(now)) {
+				next := now.Add(usageLimitFreezeDuration)
+				auth.Unavailable = true
+				auth.NextRetryAfter = next
+				auth.Quota = QuotaState{Exceeded: true, Reason: "usage_limit_reached", NextRecoverAt: next}
+				auth.UpdatedAt = now
+				runtimeFreeze = &RuntimeFreezeState{AuthID: auth.ID, Reason: "usage_limit_reached", NextRecoverAt: next}
+				if store, ok := m.store.(RuntimeFreezeStore); ok {
+					runtimeFreezeStore = store
+				}
+			}
 		} else {
 			auth.Failed++
 		}
 
 		if result.Success {
-			if result.Model != "" {
+			if auth.Quota.Exceeded && auth.Quota.Reason == "usage_limit_reached" && auth.Quota.NextRecoverAt.After(now) {
+				auth.Unavailable = true
+				auth.NextRetryAfter = auth.Quota.NextRecoverAt
+				auth.UpdatedAt = now
+			} else if result.Model != "" {
 				state := ensureModelState(auth, result.Model)
 				resetModelState(state, now)
 				updateAggregatedAvailability(auth, now)
@@ -2396,7 +2504,17 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 						case 429:
 							var next time.Time
 							backoffLevel := state.Quota.BackoffLevel
-							if !disableCooling {
+							reason := "quota"
+							usageLimitReached := isUsageLimitReachedResultError(result.Error)
+							if usageLimitReached {
+								next = now.Add(usageLimitFreezeDuration)
+								backoffLevel = 0
+								reason = "usage_limit_reached"
+								runtimeFreeze = &RuntimeFreezeState{AuthID: auth.ID, Reason: reason, NextRecoverAt: next}
+								if store, ok := m.store.(RuntimeFreezeStore); ok {
+									runtimeFreezeStore = store
+								}
+							} else if !disableCooling {
 								if result.RetryAfter != nil {
 									next = now.Add(*result.RetryAfter)
 								} else {
@@ -2410,7 +2528,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 							state.NextRetryAfter = next
 							state.Quota = QuotaState{
 								Exceeded:      true,
-								Reason:        "quota",
+								Reason:        reason,
 								NextRecoverAt: next,
 								BackoffLevel:  backoffLevel,
 							}
@@ -2434,6 +2552,11 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 					auth.Status = StatusError
 					auth.UpdatedAt = now
 					updateAggregatedAvailability(auth, now)
+					if state.Quota.Reason == "usage_limit_reached" && state.Quota.NextRecoverAt.After(now) {
+						auth.Unavailable = true
+						auth.NextRetryAfter = state.Quota.NextRecoverAt
+						auth.Quota = state.Quota
+					}
 				}
 			} else {
 				applyAuthFailureState(auth, result.Error, result.RetryAfter, now)
@@ -2444,6 +2567,11 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		authSnapshot = auth.Clone()
 	}
 	m.mu.Unlock()
+	if runtimeFreezeStore != nil && runtimeFreeze != nil {
+		if err := runtimeFreezeStore.SaveRuntimeFreeze(ctx, *runtimeFreeze); err != nil {
+			logEntryWithRequestID(ctx).WithField("auth_id", runtimeFreeze.AuthID).Warnf("failed to persist runtime freeze: %v", err)
+		}
+	}
 	if m.scheduler != nil && authSnapshot != nil {
 		m.scheduler.upsertAuth(authSnapshot)
 	}
@@ -2519,6 +2647,7 @@ func updateAggregatedAvailability(auth *Auth, now time.Time) {
 	earliestRetry := time.Time{}
 	quotaExceeded := false
 	quotaRecover := time.Time{}
+	usageLimitRecover := time.Time{}
 	maxBackoffLevel := 0
 	hasState := false
 	for _, state := range auth.ModelStates {
@@ -2550,6 +2679,11 @@ func updateAggregatedAvailability(auth *Auth, now time.Time) {
 			if quotaRecover.IsZero() || (!state.Quota.NextRecoverAt.IsZero() && state.Quota.NextRecoverAt.Before(quotaRecover)) {
 				quotaRecover = state.Quota.NextRecoverAt
 			}
+			if state.Quota.Reason == "usage_limit_reached" && state.Quota.NextRecoverAt.After(now) {
+				if usageLimitRecover.IsZero() || state.Quota.NextRecoverAt.After(usageLimitRecover) {
+					usageLimitRecover = state.Quota.NextRecoverAt
+				}
+			}
 			if state.Quota.BackoffLevel > maxBackoffLevel {
 				maxBackoffLevel = state.Quota.BackoffLevel
 			}
@@ -2565,9 +2699,19 @@ func updateAggregatedAvailability(auth *Auth, now time.Time) {
 	} else {
 		auth.NextRetryAfter = time.Time{}
 	}
+	if !usageLimitRecover.IsZero() {
+		auth.Unavailable = true
+		auth.NextRetryAfter = usageLimitRecover
+	}
 	if quotaExceeded {
+		reason := "quota"
+		if !usageLimitRecover.IsZero() {
+			reason = "usage_limit_reached"
+			quotaRecover = usageLimitRecover
+			maxBackoffLevel = 0
+		}
 		auth.Quota.Exceeded = true
-		auth.Quota.Reason = "quota"
+		auth.Quota.Reason = reason
 		auth.Quota.NextRecoverAt = quotaRecover
 		auth.Quota.BackoffLevel = maxBackoffLevel
 	} else {
@@ -2714,6 +2858,17 @@ func statusCodeFromResult(err *Error) int {
 		return 0
 	}
 	return err.StatusCode()
+}
+
+func isUsageLimitReachedResultError(err *Error) bool {
+	if err == nil || statusCodeFromResult(err) != http.StatusTooManyRequests {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(err.Code), "usage_limit_reached") {
+		return true
+	}
+	return strings.EqualFold(strings.TrimSpace(gjson.Get(err.Message, "error.type").String()), "usage_limit_reached") ||
+		strings.EqualFold(strings.TrimSpace(gjson.Get(err.Message, "body.error.type").String()), "usage_limit_reached")
 }
 
 func isModelSupportErrorMessage(message string) bool {
@@ -3080,7 +3235,7 @@ func (m *Manager) routeAwareSelectionRequired(auth *Auth, routeModel string) boo
 
 func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, error) {
 	if m.HomeEnabled() {
-		auth, exec, _, err := m.pickNextViaHome(ctx, model, opts, tried)
+		auth, exec, _, err := m.pickNextViaHomeWithRuntimeFreeze(ctx, model, opts, tried)
 		return auth, exec, err
 	}
 
@@ -3154,7 +3309,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 
 func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, error) {
 	if m.HomeEnabled() {
-		auth, exec, _, err := m.pickNextViaHome(ctx, model, opts, tried)
+		auth, exec, _, err := m.pickNextViaHomeWithRuntimeFreeze(ctx, model, opts, tried)
 		return auth, exec, err
 	}
 
@@ -3310,13 +3465,33 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 	return authCopy, executor, providerKey, nil
 }
 
+func (m *Manager) pickNextMixedLegacyWithRuntimeFreeze(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error) {
+	for {
+		auth, executor, providerKey, errPick := m.pickNextMixedLegacy(ctx, providers, model, opts, tried)
+		if errPick != nil {
+			return nil, nil, "", errPick
+		}
+		frozen, errFreeze := m.refreshRuntimeFreezeForAuth(ctx, auth)
+		if errFreeze != nil {
+			return nil, nil, "", errFreeze
+		}
+		if !frozen {
+			return auth, executor, providerKey, nil
+		}
+		if tried == nil {
+			tried = make(map[string]struct{})
+		}
+		tried[auth.ID] = struct{}{}
+	}
+}
+
 func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error) {
 	if m.HomeEnabled() {
-		return m.pickNextViaHome(ctx, model, opts, tried)
+		return m.pickNextViaHomeWithRuntimeFreeze(ctx, model, opts, tried)
 	}
 
 	if !m.useSchedulerFastPath() {
-		return m.pickNextMixedLegacy(ctx, providers, model, opts, tried)
+		return m.pickNextMixedLegacyWithRuntimeFreeze(ctx, providers, model, opts, tried)
 	}
 
 	eligibleProviders := make([]string, 0, len(providers))
@@ -3356,7 +3531,7 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 			}
 			if m.routeAwareSelectionRequired(candidate, model) {
 				m.mu.RUnlock()
-				return m.pickNextMixedLegacy(ctx, providers, model, opts, tried)
+				return m.pickNextMixedLegacyWithRuntimeFreeze(ctx, providers, model, opts, tried)
 			}
 		}
 		m.mu.RUnlock()
@@ -3374,6 +3549,17 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 		}
 		if selected == nil {
 			return nil, nil, "", &Error{Code: "auth_not_found", Message: "selector returned no auth"}
+		}
+		frozen, errFreeze := m.refreshRuntimeFreezeForAuth(ctx, selected)
+		if errFreeze != nil {
+			return nil, nil, "", errFreeze
+		}
+		if frozen {
+			if tried == nil {
+				tried = make(map[string]struct{})
+			}
+			tried[selected.ID] = struct{}{}
+			continue
 		}
 		if disallowFreeAuth && isFreeCodexAuth(selected) {
 			if tried == nil {
@@ -3396,6 +3582,33 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 			m.mu.Unlock()
 		}
 		return authCopy, executor, providerKey, nil
+	}
+}
+
+func (m *Manager) pickNextViaHomeWithRuntimeFreeze(ctx context.Context, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error) {
+	for {
+		auth, executor, providerKey, errPick := m.pickNextViaHome(ctx, model, opts, tried)
+		if errPick != nil {
+			return nil, nil, "", errPick
+		}
+		if auth == nil {
+			return nil, nil, "", &Error{Code: "auth_not_found", Message: "home returned no auth", HTTPStatus: http.StatusServiceUnavailable}
+		}
+		frozen, errFreeze := m.refreshRuntimeFreezeForAuth(ctx, auth)
+		if errFreeze != nil {
+			return nil, nil, "", errFreeze
+		}
+		if !frozen {
+			return auth, executor, providerKey, nil
+		}
+		if _, used := tried[auth.ID]; used {
+			return nil, nil, "", &Error{Code: "auth_not_found", Message: "home returned repeated frozen auth", HTTPStatus: http.StatusServiceUnavailable}
+		}
+		if tried == nil {
+			tried = make(map[string]struct{})
+		}
+		tried[auth.ID] = struct{}{}
+		opts = withHomeAuthCount(opts, homeAuthCountFromMetadata(opts.Metadata)+1)
 	}
 }
 
@@ -3897,6 +4110,9 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 			continue
 		}
 		c.auth = preparedAuth
+		if m.shouldSkipRuntimeFrozenFallbackAuth(creditsCtx, c.auth) {
+			continue
+		}
 		publishSelectedAuthMetadata(creditsOpts.Metadata, c.auth.ID)
 		models := m.executionModelCandidates(c.auth, routeModel)
 		if len(models) == 0 {
@@ -3944,6 +4160,9 @@ func (m *Manager) tryAntigravityCreditsExecuteStream(ctx context.Context, req cl
 			continue
 		}
 		c.auth = preparedAuth
+		if m.shouldSkipRuntimeFrozenFallbackAuth(creditsCtx, c.auth) {
+			continue
+		}
 		publishSelectedAuthMetadata(creditsOpts.Metadata, c.auth.ID)
 		models := m.executionModelCandidates(c.auth, routeModel)
 		if len(models) == 0 {
@@ -3956,6 +4175,15 @@ func (m *Manager) tryAntigravityCreditsExecuteStream(ctx context.Context, req cl
 		return result, true
 	}
 	return nil, false
+}
+
+func (m *Manager) shouldSkipRuntimeFrozenFallbackAuth(ctx context.Context, auth *Auth) bool {
+	frozen, err := m.refreshRuntimeFreezeForAuth(ctx, auth)
+	if err != nil {
+		logEntryWithRequestID(ctx).WithField("auth_id", auth.ID).Warnf("failed to load runtime freezes before fallback execution: %v", err)
+		return true
+	}
+	return frozen
 }
 
 func (m *Manager) persist(ctx context.Context, auth *Auth) error {
