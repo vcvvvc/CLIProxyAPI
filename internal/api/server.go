@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -34,6 +35,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/managementasset"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
@@ -42,12 +44,15 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers/openai"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/net/http2"
 	"gopkg.in/yaml.v3"
 )
 
 const oauthCallbackSuccessHTML = `<html><head><meta charset="utf-8"><title>Authentication successful</title><script>setTimeout(function(){window.close();},5000);</script></head><body><h1>Authentication successful!</h1><p>You can close this window.</p><p>This window will close automatically in 5 seconds.</p></body></html>`
+
+const codexAlphaSearchUpstreamURL = "https://chatgpt.com/backend-api/codex/alpha/search"
 
 type serverOptionConfig struct {
 	extraMiddleware      []gin.HandlerFunc
@@ -397,6 +402,7 @@ func (s *Server) setupRoutes() {
 		v1.GET("/responses", openaiResponsesHandlers.ResponsesWebsocket)
 		v1.POST("/responses", openaiResponsesHandlers.Responses)
 		v1.POST("/responses/compact", openaiResponsesHandlers.Compact)
+		v1.POST("/alpha/search", s.codexAlphaSearch)
 	}
 
 	// Codex CLI direct route aliases (chatgpt_base_url compatible)
@@ -406,6 +412,7 @@ func (s *Server) setupRoutes() {
 		codexDirect.GET("/responses", openaiResponsesHandlers.ResponsesWebsocket)
 		codexDirect.POST("/responses", openaiResponsesHandlers.Responses)
 		codexDirect.POST("/responses/compact", openaiResponsesHandlers.Compact)
+		codexDirect.POST("/alpha/search", s.codexAlphaSearch)
 	}
 
 	// Gemini compatible API routes
@@ -504,6 +511,212 @@ func (s *Server) setupRoutes() {
 	})
 
 	// Management routes are registered lazily by registerManagementRoutes when a secret is configured.
+}
+
+// What：从 Alpha Search HTTP 请求读取受限大小的原始 body。
+// Why：在解析和转发前统一限制输入规模，避免 handler 各自处理边界条件。
+func readCodexAlphaSearchRequestBody(c *gin.Context) ([]byte, error) {
+	if c == nil || c.Request == nil || c.Request.Body == nil {
+		return nil, errors.New("Codex Alpha Search request body is unavailable")
+	}
+	return io.ReadAll(io.LimitReader(c.Request.Body, 16<<20))
+}
+
+// What：清理 Codex Alpha Search 请求中上游不接受的缓存字段。
+// Why：保留客户端原始请求结构，同时避免上游因私有缓存参数拒绝请求。
+func sanitizeCodexAlphaSearchBody(body []byte) []byte {
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(body, &payload); err != nil || payload == nil {
+		return body
+	}
+
+	removed := false
+	for _, field := range []string{"prompt_cache_key", "prompt_cache_retention"} {
+		if _, ok := payload[field]; ok {
+			delete(payload, field)
+			removed = true
+		}
+	}
+	if !removed {
+		return body
+	}
+
+	sanitized, err := json.Marshal(payload)
+	if err != nil {
+		return body
+	}
+	return sanitized
+}
+
+// What：提取 Alpha Search 请求中的会话 ID 和模型名。
+// Why：把路由字段解析与后续认证、转发决策分离，避免重复解码原始 body。
+func parseCodexAlphaSearchRouting(body []byte) (string, string) {
+	var routing struct {
+		ID    string `json:"id"`
+		Model string `json:"model"`
+	}
+	_ = json.Unmarshal(body, &routing)
+	return strings.TrimSpace(routing.ID), strings.TrimSpace(routing.Model)
+}
+
+// What：构造 Alpha Search 调用现有选择器所需的请求上下文参数。
+// Why：克隆客户端 headers，避免注入会话 ID 时修改 Gin 持有的原始请求。
+func buildCodexAlphaSearchSelectionOptions(headers http.Header, sessionID string, body []byte) coreexecutor.Options {
+	selectionHeaders := headers.Clone()
+	if selectionHeaders == nil {
+		selectionHeaders = make(http.Header)
+	}
+	if sessionID = strings.TrimSpace(sessionID); sessionID != "" {
+		selectionHeaders.Set("X-Session-ID", sessionID)
+	}
+	return coreexecutor.Options{Headers: selectionHeaders, OriginalRequest: body}
+}
+
+// What：构造发送到 Codex Alpha Search 上游的 HTTP headers。
+// Why：只传递 PR 明确要求的客户端身份字段，避免把代理内部 headers 泄露给上游。
+func buildCodexAlphaSearchUpstreamHeaders(clientHeaders http.Header, selected *auth.Auth) http.Header {
+	headers := make(http.Header)
+	headers.Set("Content-Type", "application/json")
+	headers.Set("Accept", "application/json")
+	headers.Set("Originator", "codex_cli_rs")
+	for _, name := range []string{"Version", "User-Agent", "Session_id", "X-Client-Request-Id"} {
+		if value := strings.TrimSpace(clientHeaders.Get(name)); value != "" {
+			headers.Set(name, value)
+		}
+	}
+	if selected != nil && selected.Metadata != nil {
+		if accountID, ok := selected.Metadata["account_id"].(string); ok {
+			if accountID = strings.TrimSpace(accountID); accountID != "" {
+				headers.Set("Chatgpt-Account-Id", accountID)
+			}
+		}
+	}
+	return headers
+}
+
+// What：使用选中的 OAuth auth 构造并发送 Alpha Search 上游请求。
+// Why：集中复用 AuthManager 的凭据注入和 HTTP transport，避免 handler 旁路认证逻辑。
+func (s *Server) executeCodexAlphaSearchUpstream(ctx context.Context, selected *auth.Auth, body []byte, headers http.Header) (*http.Response, error) {
+	if s == nil || s.handlers == nil || s.handlers.AuthManager == nil {
+		return nil, errors.New("Codex auth manager unavailable")
+	}
+	req, err := s.handlers.AuthManager.NewHttpRequest(
+		ctx, selected, http.MethodPost, codexAlphaSearchUpstreamURL, body, headers,
+	)
+	if err != nil {
+		return nil, err
+	}
+	var authID, authLabel, authType, authValue string
+	if selected != nil {
+		authID = selected.ID
+		authLabel = selected.Label
+		authType, authValue = selected.AccountInfo()
+	}
+	helps.RecordAPIRequest(ctx, s.cfg, helps.UpstreamRequestLog{
+		URL:       codexAlphaSearchUpstreamURL,
+		Method:    http.MethodPost,
+		Headers:   req.Header.Clone(),
+		Body:      body,
+		Provider:  "codex",
+		AuthID:    authID,
+		AuthLabel: authLabel,
+		AuthType:  authType,
+		AuthValue: authValue,
+	})
+	resp, err := s.handlers.AuthManager.HttpRequest(ctx, selected, req)
+	if err != nil {
+		helps.RecordAPIResponseError(ctx, s.cfg, err)
+	}
+	return resp, err
+}
+
+// What：读取 Alpha Search 上游响应并回传状态、类型和 body。
+// Why：集中管理响应大小和 body 生命周期，避免 handler 遗漏关闭或错误改写状态。
+func (s *Server) relayCodexAlphaSearchResponse(ctx context.Context, c *gin.Context, resp *http.Response) ([]byte, error, error) {
+	if s == nil || c == nil || resp == nil || resp.Body == nil {
+		return nil, errors.New("invalid Codex Alpha Search response"), nil
+	}
+	defer func() {
+		if errClose := resp.Body.Close(); errClose != nil {
+			log.Errorf("codex alpha search: close response body error: %v", errClose)
+		}
+	}()
+	helps.RecordAPIResponseMetadata(ctx, s.cfg, resp.StatusCode, resp.Header.Clone())
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
+	if err != nil {
+		helps.RecordAPIResponseError(ctx, s.cfg, err)
+		return nil, err, nil
+	}
+	helps.AppendAPIResponseChunk(ctx, s.cfg, body)
+	if contentType := resp.Header.Get("Content-Type"); contentType != "" {
+		c.Header("Content-Type", contentType)
+	}
+	c.Status(resp.StatusCode)
+	_, err = c.Writer.Write(body)
+	return body, nil, err
+}
+
+// What：把 GPT-5.6 Alpha Search 的上游结果转换为统一 auth 运行结果。
+// Why：直连代理绕过 Execute，必须显式回写成功计数、limit_50 和 usage-limit freeze。
+func codexAlphaSearchResult(selected *auth.Auth, model string, status int, body []byte, err error) auth.Result {
+	if strings.TrimSpace(model) == "" && status == http.StatusTooManyRequests {
+		model = "gpt-5.6"
+	}
+	result := auth.Result{Provider: "codex", Model: model, Success: err == nil && status >= 200 && status < 300}
+	if selected != nil {
+		result.AuthID = selected.ID
+	}
+	if !result.Success {
+		message := string(body)
+		if err != nil {
+			message = err.Error()
+		}
+		result.Error = &auth.Error{HTTPStatus: status, Message: message}
+	}
+	return result
+}
+
+// What：编排 GPT-5.6 Alpha Search 的认证选择、直连转发和响应回传。
+// Why：该请求已经是 Codex Search 格式，必须绕过 Responses 翻译但复用原有 auth 调度。
+func (s *Server) codexAlphaSearch(c *gin.Context) {
+	if s == nil || s.handlers == nil || s.handlers.AuthManager == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Codex auth manager unavailable"})
+		return
+	}
+	body, err := readCodexAlphaSearchRequestBody(c)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to read search request"})
+		return
+	}
+	sessionID, model := parseCodexAlphaSearchRouting(body)
+	ctx := context.WithValue(c.Request.Context(), "gin", c)
+	selected, err := s.handlers.AuthManager.SelectCodexOAuthAuth(
+		ctx, model, buildCodexAlphaSearchSelectionOptions(c.Request.Header, sessionID, body),
+	)
+	if err != nil {
+		status := http.StatusServiceUnavailable
+		if statusError, ok := err.(interface{ StatusCode() int }); ok && statusError.StatusCode() > 0 {
+			status = statusError.StatusCode()
+		}
+		c.JSON(status, gin.H{"error": err.Error()})
+		return
+	}
+	resp, err := s.executeCodexAlphaSearchUpstream(
+		ctx, selected, sanitizeCodexAlphaSearchBody(body), buildCodexAlphaSearchUpstreamHeaders(c.Request.Header, selected),
+	)
+	if err != nil {
+		s.handlers.AuthManager.MarkResult(ctx, codexAlphaSearchResult(selected, model, 0, nil, err))
+		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		return
+	}
+	responseBody, readErr, writeErr := s.relayCodexAlphaSearchResponse(ctx, c, resp)
+	s.handlers.AuthManager.MarkResult(ctx, codexAlphaSearchResult(selected, model, resp.StatusCode, responseBody, readErr))
+	if readErr != nil && !c.Writer.Written() {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "Failed to read Codex search response"})
+	}
+	if writeErr != nil {
+		log.Errorf("codex alpha search: downstream response write error: %v", writeErr)
+	}
 }
 
 // AttachWebsocketRoute registers a websocket upgrade handler on the primary Gin engine.
