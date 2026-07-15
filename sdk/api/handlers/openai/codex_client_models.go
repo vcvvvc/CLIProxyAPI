@@ -54,6 +54,7 @@ func buildCodexClientModels(models []map[string]any) []map[string]any {
 
 		if template, ok := templates[id]; ok {
 			entry := cloneCodexClientModelMap(template)
+			applyCodexClientSearchToolSupport(entry, id, true, registry.GetGlobalRegistry().GetModelProviders(id))
 			sanitizeCodexClientReasoningMetadata(entry)
 			applyCodexClientVisibilityOverride(entry, id)
 			result = append(result, entry)
@@ -62,6 +63,7 @@ func buildCodexClientModels(models []map[string]any) []map[string]any {
 
 		entry := cloneCodexClientModelMap(defaultTemplate)
 		applyCodexClientModelMetadata(entry, id, model)
+		applyCodexClientSearchToolSupport(entry, id, false, nil)
 		sanitizeCodexClientReasoningMetadata(entry)
 		applyCodexClientVisibilityOverride(entry, id)
 		result = append(result, entry)
@@ -96,6 +98,28 @@ func loadCodexClientModelTemplates() (map[string]map[string]any, map[string]any,
 	})
 
 	return codexClientModelTemplates, codexClientDefaultTemplate, codexClientModelTemplatesErr
+}
+
+// What：按模板存在性和实际 provider 集合过滤 GPT-5.6 Search 能力声明。
+// Why：Alpha Search 仅属于 GPT-5.6，不能改变 GPT-5.5 及更早模型的原有 Search 行为。
+func applyCodexClientSearchToolSupport(entry map[string]any, id string, templateModel bool, providers []string) {
+	if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(id)), "gpt-5.6") {
+		return
+	}
+	supportsSearch, _ := entry["supports_search_tool"].(bool)
+	if !supportsSearch {
+		return
+	}
+	if !templateModel || len(providers) == 0 {
+		entry["supports_search_tool"] = false
+		return
+	}
+	for _, provider := range providers {
+		if !strings.EqualFold(strings.TrimSpace(provider), "codex") {
+			entry["supports_search_tool"] = false
+			return
+		}
+	}
 }
 
 func applyCodexClientModelMetadata(entry map[string]any, id string, model map[string]any) {
