@@ -3322,6 +3322,42 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 	return authCopy, executor, nil
 }
 
+// What：为 GPT-5.6 Alpha Search 选择一个 Codex OAuth 凭据。
+// Why：复用原有调度器和冻结状态，避免旁路 HTTP 代理误用 API Key 或冻结 auth。
+func (m *Manager) SelectCodexOAuthAuth(ctx context.Context, model string, opts cliproxyexecutor.Options) (*Auth, error) {
+	homeMode := m.HomeEnabled()
+	homeAuthCount := homeAuthCountFromMetadata(opts.Metadata)
+	tried := make(map[string]struct{})
+	for {
+		pickOpts := opts
+		if homeMode {
+			pickOpts = withHomeAuthCount(opts, homeAuthCount)
+		}
+		triedBeforePick := len(tried)
+		selected, _, errPick := m.pickNext(ctx, "codex", model, pickOpts, tried)
+		if errPick != nil {
+			return nil, errPick
+		}
+		if selected == nil {
+			return nil, &Error{Code: "auth_not_found", Message: "selector returned no auth"}
+		}
+		if authType, _ := selected.AccountInfo(); strings.EqualFold(strings.TrimSpace(selected.Provider), "codex") && strings.EqualFold(strings.TrimSpace(authType), "oauth") {
+			return selected, nil
+		}
+		authID := strings.TrimSpace(selected.ID)
+		if authID == "" {
+			return nil, &Error{Code: "auth_not_found", Message: "selected auth has no ID"}
+		}
+		if _, alreadyTried := tried[authID]; alreadyTried {
+			return nil, &Error{Code: "auth_not_found", Message: "selector repeatedly returned a non-OAuth auth"}
+		}
+		tried[authID] = struct{}{}
+		if homeMode {
+			homeAuthCount += len(tried) - triedBeforePick
+		}
+	}
+}
+
 func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, error) {
 	if m.HomeEnabled() {
 		auth, exec, _, err := m.pickNextViaHomeWithRuntimeFreeze(ctx, model, opts, tried)
