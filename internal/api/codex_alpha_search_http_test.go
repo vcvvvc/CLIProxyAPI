@@ -50,7 +50,7 @@ func TestCodexAlphaSearchHTTPBoundaries(t *testing.T) {
 	}
 }
 
-// What：验证 Alpha Search 结果回写可触发 GPT-5.6 的 limit_50 与 usage-limit freeze。
+// What：验证 Alpha Search 结果回写可触发 GPT-5.6 的默认 limit_50 与 usage-limit freeze。
 // Why：该路由绕过通用 Execute，必须单独证明成功计数和上游 429 都进入 MarkResult。
 func TestCodexAlphaSearchResultUpdatesFreezeState(t *testing.T) {
 	ctx := cliproxyAuth.WithSkipPersist(context.Background())

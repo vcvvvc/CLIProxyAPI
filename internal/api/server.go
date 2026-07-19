@@ -657,7 +657,7 @@ func (s *Server) relayCodexAlphaSearchResponse(ctx context.Context, c *gin.Conte
 }
 
 // What：把 GPT-5.6 Alpha Search 的上游结果转换为统一 auth 运行结果。
-// Why：直连代理绕过 Execute，必须显式回写成功计数、limit_50 和 usage-limit freeze。
+// Why：直连代理绕过 Execute，必须显式回写成功计数、limit_<N> 和 usage-limit freeze。
 func codexAlphaSearchResult(selected *auth.Auth, model string, status int, body []byte, err error) auth.Result {
 	if strings.TrimSpace(model) == "" && status == http.StatusTooManyRequests {
 		model = "gpt-5.6"
