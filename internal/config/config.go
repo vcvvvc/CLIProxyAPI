@@ -76,6 +76,8 @@ type Config struct {
 
 	// DisableCooling disables quota cooldown scheduling when true.
 	DisableCooling bool `yaml:"disable-cooling" json:"disable-cooling"`
+	// SuccessFreezeLimit controls successful requests per auth before runtime freeze.
+	SuccessFreezeLimit int64 `yaml:"success-freeze-limit" json:"success-freeze-limit"`
 
 	// AuthAutoRefreshWorkers overrides the size of the core auth auto-refresh worker pool.
 	// When <= 0, the default worker count is used.

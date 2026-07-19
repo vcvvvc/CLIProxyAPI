@@ -85,7 +85,6 @@ const (
 	quotaBackoffMax           = 30 * time.Minute
 	usageLimitFreezeDuration  = 721 * time.Hour
 	successFreezeThreshold    = int64(50)
-	successFreezeReason       = "limit_50"
 )
 
 var quotaCooldownDisabled atomic.Bool
@@ -1277,13 +1276,29 @@ func applyRuntimeFreezes(auths map[string]*Auth, freezes []RuntimeFreezeState, n
 	}
 }
 
+// What：根据实际生效的成功次数上限生成可持久化的冻结原因。
+// Why：原因需要记录触发时的上限，同时让旧的 limit_50 记录继续兼容。
+func successFreezeReasonForLimit(limit int64) string {
+	if limit <= 0 {
+		limit = successFreezeThreshold
+	}
+	return "limit_" + strconv.FormatInt(limit, 10)
+}
+
 func isRuntimeFreezeReason(reason string) bool {
-	switch strings.TrimSpace(reason) {
-	case "usage_limit_reached", successFreezeReason:
+	reason = strings.TrimSpace(reason)
+	if reason == "usage_limit_reached" {
 		return true
-	default:
+	}
+	if !strings.HasPrefix(reason, "limit_") {
 		return false
 	}
+	value := strings.TrimPrefix(reason, "limit_")
+	if value == "" || strings.Trim(value, "0123456789") != "" {
+		return false
+	}
+	limit, err := strconv.ParseInt(value, 10, 64)
+	return err == nil && limit > 0
 }
 
 func (m *Manager) refreshRuntimeFreezeForAuth(ctx context.Context, auth *Auth) (bool, error) {
@@ -2399,6 +2414,11 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	if result.AuthID == "" {
 		return
 	}
+	successFreezeLimit := successFreezeThreshold
+	if cfg, ok := m.runtimeConfig.Load().(*internalconfig.Config); ok && cfg != nil && cfg.SuccessFreezeLimit > 0 {
+		successFreezeLimit = cfg.SuccessFreezeLimit
+	}
+	successFreezeReason := successFreezeReasonForLimit(successFreezeLimit)
 
 	shouldResumeModel := false
 	shouldSuspendModel := false
@@ -2416,7 +2436,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		if result.Success {
 			auth.Success++
 			auth.successFreezeCount++
-			if auth.successFreezeCount == successFreezeThreshold && !(auth.Quota.Exceeded && isRuntimeFreezeReason(auth.Quota.Reason) && auth.Quota.NextRecoverAt.After(now)) {
+			if auth.successFreezeCount >= successFreezeLimit && !(auth.Quota.Exceeded && isRuntimeFreezeReason(auth.Quota.Reason) && auth.Quota.NextRecoverAt.After(now)) {
 				next := now.Add(usageLimitFreezeDuration)
 				auth.Unavailable = true
 				auth.NextRetryAfter = next
